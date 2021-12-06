@@ -111,20 +111,6 @@ void stop_timer(seq_nr k) {
 void wait_for_event(event_type *event) {
   while (1) {
     check_timers();
-    if (frame_arrival_event) {
-      *event = frame_arrival;
-      pthread_mutex_lock(&event_lock);
-      frame_arrival_event = 0;
-      pthread_mutex_unlock(&event_lock);
-      return;
-    }
-    if (cksum_err_event) {
-      *event = cksum_err;
-      pthread_mutex_lock(&event_lock);
-      cksum_err_event = 0;
-      pthread_mutex_unlock(&event_lock);
-      return;
-    }
     if (timeout_event) {
       *event = timeout;
       pthread_mutex_lock(&event_lock);
@@ -139,7 +125,22 @@ void wait_for_event(event_type *event) {
       pthread_mutex_unlock(&event_lock);
       return;
     }
-    usleep(1000);
+    if (frame_arrival_event) {
+      *event = frame_arrival;
+      pthread_mutex_lock(&event_lock);
+      frame_arrival_event = 0;
+      pthread_mutex_unlock(&event_lock);
+      return;
+    }
+    if (cksum_err_event) {
+      *event = cksum_err;
+      pthread_mutex_lock(&event_lock);
+      cksum_err_event = 0;
+      pthread_mutex_unlock(&event_lock);
+      return;
+    }
+    
+    // usleep(1000);
   }
 }
 
@@ -184,8 +185,8 @@ void *physical_layer(void *) {
 
     if (read_bytes == sizeof(frame)) {
       read_bytes = 0;
-      // 80% chance of getting a frame
-      if ((rand() % 10) < 8) {
+      // 90% chance of getting a frame
+      if ((rand() % 100) < 90) {
         pthread_mutex_lock(&event_lock);
         frame_arrival_event = 1;
         pthread_mutex_unlock(&event_lock);
@@ -288,7 +289,7 @@ void *go_back_n_protocol(void *) {
         inc(frame_expected);
         n_sent_to_network_layer++;
       }
-      while (between(ack_expected, frame_expected, r.ack)) {
+      while (between(ack_expected, r.ack, next_frame_to_send)) {
         nbuffered--;
         stop_timer(ack_expected);
         inc(ack_expected);
@@ -301,7 +302,6 @@ void *go_back_n_protocol(void *) {
       n_received_from_network_layer++;
 
       nbuffered++;
-      inc(frame_expected);
       send_data(next_frame_to_send, frame_expected, buffer);
       inc(next_frame_to_send);
       break;
