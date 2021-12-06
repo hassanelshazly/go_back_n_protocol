@@ -19,7 +19,7 @@ pthread_mutex_t timer_lock;
 
 #define MAX_PKT 8
 #define MAX_SEQ 7
-#define MAX_TIMEOUT 500
+#define MAX_TIMEOUT 5000
 
 typedef unsigned int seq_nr;
 typedef struct {
@@ -82,7 +82,9 @@ void check_timers() {
   pthread_mutex_lock(&timer_lock);
   if (!timers.empty() && timers.front().second < current_time) {
     timers.clear();
+    pthread_mutex_lock(&event_lock);
     timeout_event = 1;
+    pthread_mutex_unlock(&event_lock);
   }
   pthread_mutex_unlock(&timer_lock);
 }
@@ -109,20 +111,6 @@ void stop_timer(seq_nr k) {
 void wait_for_event(event_type *event) {
   while (1) {
     check_timers();
-    if (timeout_event) {
-      *event = timeout;
-      pthread_mutex_lock(&event_lock);
-      timeout_event = 0;
-      pthread_mutex_unlock(&event_lock);
-      return;
-    }
-    if (network_layer_ready_event && network_layer_enabled) {
-      *event = network_layer_ready;
-      pthread_mutex_lock(&event_lock);
-      network_layer_ready_event = 0;
-      pthread_mutex_unlock(&event_lock);
-      return;
-    }
     if (frame_arrival_event) {
       *event = frame_arrival;
       pthread_mutex_lock(&event_lock);
@@ -134,6 +122,20 @@ void wait_for_event(event_type *event) {
       *event = cksum_err;
       pthread_mutex_lock(&event_lock);
       cksum_err_event = 0;
+      pthread_mutex_unlock(&event_lock);
+      return;
+    }
+    if (timeout_event) {
+      *event = timeout;
+      pthread_mutex_lock(&event_lock);
+      timeout_event = 0;
+      pthread_mutex_unlock(&event_lock);
+      return;
+    }
+    if (network_layer_ready_event && network_layer_enabled) {
+      *event = network_layer_ready;
+      pthread_mutex_lock(&event_lock);
+      network_layer_ready_event = 0;
       pthread_mutex_unlock(&event_lock);
       return;
     }
@@ -245,7 +247,7 @@ static void send_data(seq_nr frame_nr, seq_nr frame_expected, packet buffer[]) {
   frame s;
   s.kind = data;
   s.seq = frame_nr;
-  s.ack = (frame_expected + MAX_SEQ - 1) % MAX_SEQ;
+  s.ack = (frame_expected + MAX_SEQ) % (MAX_SEQ + 1);
   s.info = buffer[frame_nr];
   to_physical_layer(&s);
   n_sent_to_physical_layer++;
@@ -299,7 +301,7 @@ void *go_back_n_protocol(void *) {
       n_received_from_network_layer++;
 
       nbuffered++;
-      frame_expected = (frame_expected + 1) % MAX_SEQ;
+      inc(frame_expected);
       send_data(next_frame_to_send, frame_expected, buffer);
       inc(next_frame_to_send);
       break;
@@ -308,9 +310,10 @@ void *go_back_n_protocol(void *) {
       break;
 
     case timeout:
+      printf("timeout: resending from frame #%d\n", ack_expected);
       n_total_timeouts++;
       next_frame_to_send = ack_expected;
-      for (int i = 0; i <= nbuffered; i++) {
+      for (int i = 1; i <= nbuffered; i++) {
         send_data(next_frame_to_send, frame_expected, buffer);
         inc(next_frame_to_send);
       }
@@ -397,8 +400,8 @@ int main(int argc, char *argv[]) {
   pthread_t network_layer_thread;
   pthread_t physical_layer_thread;
   pthread_create(&data_link_layer_thread, NULL, &go_back_n_protocol, NULL);
-  pthread_create(&physical_layer_thread, NULL, &physical_layer, NULL);
   pthread_create(&network_layer_thread, NULL, &network_layer, NULL);
+  pthread_create(&physical_layer_thread, NULL, &physical_layer, NULL);
 
   pthread_join(data_link_layer_thread, NULL);
   pthread_join(network_layer_thread, NULL);
