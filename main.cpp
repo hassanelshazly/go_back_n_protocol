@@ -1,16 +1,25 @@
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <list>
 #include <memory.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
 #include <unistd.h>
+#include <utility>
 
 pthread_mutex_t event_lock;
+pthread_mutex_t timer_lock;
 
 #define MAX_PKT 8
 #define MAX_SEQ 7
+#define MAX_TIMEOUT 500
 
 typedef unsigned int seq_nr;
 typedef struct {
@@ -33,29 +42,73 @@ typedef enum {
   network_layer_ready
 } event_type;
 
+// typedef unsigned long long time_t;
+
 int frame_arrival_event = 0;
 int cksum_err_event = 0;
 int timeout_event = 0;
 int network_layer_ready_event = 0;
 int network_layer_enabled = 0;
 
+packet *received_packet;
+
+int send_fd;
+int recv_fd;
+
+bool master;
+
+char read_buffer[sizeof(frame)];
+size_t read_bytes;
+
+std::list<std::pair<seq_nr, time_t>> timers;
+
+int n_sent_to_physical_layer = 0;
+int n_received_from_physical_layer = 0;
+int n_sent_to_network_layer = 0;
+int n_received_from_network_layer = 0;
+int n_total_timeouts = 0;
+bool stats_printed = false;
+
+// Retuens the current time in milliseconds
+time_t get_time() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
+}
+
+// Check if any timer has expired
+void check_timers() {
+  time_t current_time = get_time();
+  pthread_mutex_lock(&timer_lock);
+  if (!timers.empty() && timers.front().second < current_time) {
+    timers.clear();
+    timeout_event = 1;
+  }
+  pthread_mutex_unlock(&timer_lock);
+}
+
+// Start the dock running and enable the timeout event,
+void start_timer(seq_nr k) {
+  pthread_mutex_lock(&timer_lock);
+  timers.push_back(std::make_pair(k, get_time() + MAX_TIMEOUT));
+  pthread_mutex_unlock(&timer_lock);
+}
+
+// Stop the clock and disable the timeout event.
+void stop_timer(seq_nr k) {
+  pthread_mutex_lock(&timer_lock);
+  for (auto it = timers.begin(); it != timers.end(); it++)
+    if (it->first == k) {
+      timers.erase(it);
+      break;
+    }
+  pthread_mutex_unlock(&timer_lock);
+}
+
 // Wait for an event to happen; return its type in event.
 void wait_for_event(event_type *event) {
   while (1) {
-    if (frame_arrival_event) {
-      *event = frame_arrival;
-      pthread_mutex_lock(&event_lock);
-      frame_arrival_event = 0;
-      pthread_mutex_unlock(&event_lock);
-      return;
-    }
-    if (cksum_err_event) {
-      *event = cksum_err;
-      pthread_mutex_lock(&event_lock);
-      cksum_err_event = 0;
-      pthread_mutex_unlock(&event_lock);
-      return;
-    }
+    check_timers();
     if (timeout_event) {
       *event = timeout;
       pthread_mutex_lock(&event_lock);
@@ -70,69 +123,94 @@ void wait_for_event(event_type *event) {
       pthread_mutex_unlock(&event_lock);
       return;
     }
+    if (frame_arrival_event) {
+      *event = frame_arrival;
+      pthread_mutex_lock(&event_lock);
+      frame_arrival_event = 0;
+      pthread_mutex_unlock(&event_lock);
+      return;
+    }
+    if (cksum_err_event) {
+      *event = cksum_err;
+      pthread_mutex_lock(&event_lock);
+      cksum_err_event = 0;
+      pthread_mutex_unlock(&event_lock);
+      return;
+    }
     usleep(1000);
   }
 }
 
 // Fetch a packet from the network layer for transmission on the channel.
-packet *g_packet;
 void *network_layer(void *) {
   while (1) {
-    packet *p = (packet *)malloc(sizeof(packet));
     sleep(1);
-    p->data[0] = 'a';
-    p->data[0] = 'b';
-    g_packet = p;
-    pthread_mutex_lock(&event_lock);
-    network_layer_ready_event = 1;
-    pthread_mutex_unlock(&event_lock);
+
+    if (network_layer_enabled) {
+      packet *p = (packet *)malloc(sizeof(packet));
+      for (int i = 0; i < MAX_PKT - 1; i++) {
+        p->data[i] = 'a' + (rand() % (('z' - 'a') + 1));
+      }
+      p->data[MAX_PKT - 1] = '\0';
+      received_packet = p;
+
+      pthread_mutex_lock(&event_lock);
+      network_layer_ready_event = 1;
+      pthread_mutex_unlock(&event_lock);
+    }
   }
 }
 
-void from_network_layer(packet *p) { p = g_packet; }
+void from_network_layer(packet *p) {
+  *p = *received_packet;
+  printf("network layer sent packet: %s\n", p->data);
+  fflush(stdout);
+}
 
 // Deliver information from an inbound frame to the network layer.
 void to_network_layer(packet *p) {
-  printf("network layer rececved: %s\n", p->data);
+  printf("network layer received packet: %s\n", p->data);
+  fflush(stdout);
+}
+
+void *physical_layer(void *) {
+  while (1) {
+    int retcode;
+    while ((retcode = read(recv_fd, read_buffer + read_bytes,
+                           sizeof(frame) - read_bytes)) > 0)
+      read_bytes += retcode;
+
+    if (read_bytes == sizeof(frame)) {
+      read_bytes = 0;
+      // 80% chance of getting a frame
+      if ((rand() % 10) < 8) {
+        pthread_mutex_lock(&event_lock);
+        frame_arrival_event = 1;
+        pthread_mutex_unlock(&event_lock);
+      }
+    }
+  }
 }
 
 // Go get an inbound frame from the physical layer and copy it to r.
-int send_fd;
-int recv_fd;
 void from_physical_layer(frame *r) {
-  if (read(recv_fd, &r, sizeof(frame)) < 0)
-    perror("from_physical_layer: read faild");
-  printf("%d %d\n", r->seq, r->ack);
-  printf("%s\n", "rececved from physical layer");
-  printf("%lu\n", sizeof(r->info.data));
+  memcpy(r, read_buffer, sizeof(frame));
+
+  printf("frame #%d received from physical layer with ack #%d: %s\n", r->seq,
+         r->ack, r->info.data);
+
+  fflush(stdout);
 }
 
 // Pass the frame to the physical layer for transmission,
-void to_physical_layer(frame *s) {
-  printf("%d %d\n", s->seq, s->ack);
-  printf("%s\n", "write to physical layer");
-  printf("%lu\n", sizeof(s->info.data));
-  if (write(send_fd, s, sizeof(frame)) < 0)
+void to_physical_layer(frame *r) {
+  if (write(send_fd, r, sizeof(frame)) < 0)
     perror("to_physical_layer: write failed");
+
+  printf("frame #%d sent to physical layer with ack #%d: %s\n", r->seq, r->ack,
+         r->info.data);
+  fflush(stdout);
 }
-
-// Start the dock running and enable the timeout event,
-void start_timer(seq_nr k) {
-  // start timer
-  sleep(5);
-  pthread_mutex_lock(&event_lock);
-  timeout_event = 1;
-  pthread_mutex_unlock(&event_lock);
-}
-
-// Stop the clock and disable the timeout event.
-void stop_timer(seq_nr k) {}
-
-// Start an auxiliary timer and enable the ack timeout event.
-void start_ack_timer(void) {}
-
-// Stop the auxiliary timer and disable the ack timeout event.
-void stop_ack_timer(void) {}
 
 // Allow the network layer to cause a network layer ready event.
 void enable_network_layer(void) {
@@ -170,6 +248,7 @@ static void send_data(seq_nr frame_nr, seq_nr frame_expected, packet buffer[]) {
   s.ack = (frame_expected + MAX_SEQ - 1) % MAX_SEQ;
   s.info = buffer[frame_nr];
   to_physical_layer(&s);
+  n_sent_to_physical_layer++;
   start_timer(frame_nr);
 }
 
@@ -200,10 +279,12 @@ void *go_back_n_protocol(void *) {
     switch (event) {
     case frame_arrival:
       from_physical_layer(&r);
+      n_received_from_physical_layer++;
 
       if (r.seq == frame_expected) {
         to_network_layer(&r.info);
         inc(frame_expected);
+        n_sent_to_network_layer++;
       }
       while (between(ack_expected, frame_expected, r.ack)) {
         nbuffered--;
@@ -215,6 +296,8 @@ void *go_back_n_protocol(void *) {
     case network_layer_ready:
       // Accept, save, and transmit a new frame.
       from_network_layer(&buffer[next_frame_to_send]);
+      n_received_from_network_layer++;
+
       nbuffered++;
       frame_expected = (frame_expected + 1) % MAX_SEQ;
       send_data(next_frame_to_send, frame_expected, buffer);
@@ -225,6 +308,7 @@ void *go_back_n_protocol(void *) {
       break;
 
     case timeout:
+      n_total_timeouts++;
       next_frame_to_send = ack_expected;
       for (int i = 0; i <= nbuffered; i++) {
         send_data(next_frame_to_send, frame_expected, buffer);
@@ -241,36 +325,90 @@ void *go_back_n_protocol(void *) {
   }
 }
 
+void print_stats() {
+  printf("\tTotal data frames sent to physical layer:       %9d\n",
+         n_sent_to_physical_layer);
+  printf("\tTotal data frames received from physical layer: %9d\n",
+         n_received_from_physical_layer);
+  printf("\tTotal data frames sent to network layer:        %9d\n",
+         n_sent_to_network_layer);
+  printf("\tTotal data frames received from network layer:  %9d\n",
+         n_received_from_network_layer);
+  printf("\tTimeouts:                                       %9d\n",
+         n_total_timeouts);
+}
+
+void exit_handler(int signum) {
+  if (stats_printed == false) {
+    stats_printed = true;
+    printf("%s", "\n");
+    print_stats();
+    printf("%s", "\n");
+  }
+  exit(signum);
+}
+
 int main(int argc, char *argv[]) {
-  int fd1[2];
-  int fd2[2];
+  srand(time(NULL));
+  master = strcmp(argv[1], "master") ? true : false;
+ 
+  // Set up signal handlers.
+  for (int i = 1; i < _NSIG; i++) {
+    signal(i, exit_handler);
+  }
 
-  pipe(fd1);
-  pipe(fd2);
+  mkfifo("/tmp/go-back-n-fifo-0", S_IFIFO | 0640);
+  mkfifo("/tmp/go-back-n-fifo-1", S_IFIFO | 0640);
 
-  if (fork() > 0) {
-    close(fd1[1]);
-    close(fd2[0]);
-    send_fd = fd2[1];
-    recv_fd = fd1[0];
+  if (master) {
+    send_fd = open("/tmp/go-back-n-fifo-0", O_WRONLY);
+    if (send_fd == -1) {
+      perror("Error opening write FD on Master");
+      return 1;
+    }
+    recv_fd = open("/tmp/go-back-n-fifo-1", O_RDONLY);
+    if (recv_fd == -1) {
+      perror("Error opening read FD on Master");
+      return 1;
+    }
   } else {
-    close(fd1[0]);
-    close(fd2[1]);
-    send_fd = fd1[1];
-    recv_fd = fd2[0];
+    recv_fd = open("/tmp/go-back-n-fifo-0", O_RDONLY);
+    if (recv_fd == -1) {
+      perror("Error opening read FD on Slave");
+      return 1;
+    }
+    send_fd = open("/tmp/go-back-n-fifo-1", O_WRONLY);
+    if (send_fd == -1) {
+      perror("Error opening write FD on Slave");
+      return 1;
+    }
   }
 
   if (pthread_mutex_init(&event_lock, NULL) != 0) {
-    printf("\n mutex init has failed\n");
+    perror("\n mutex init has failed\n");
+    return 1;
+  }
+  if (pthread_mutex_init(&timer_lock, NULL) != 0) {
+    perror("\n mutex init has failed\n");
     return 1;
   }
 
   pthread_t data_link_layer_thread;
   pthread_t network_layer_thread;
+  pthread_t physical_layer_thread;
   pthread_create(&data_link_layer_thread, NULL, &go_back_n_protocol, NULL);
+  pthread_create(&physical_layer_thread, NULL, &physical_layer, NULL);
   pthread_create(&network_layer_thread, NULL, &network_layer, NULL);
 
   pthread_join(data_link_layer_thread, NULL);
   pthread_join(network_layer_thread, NULL);
+  pthread_join(physical_layer_thread, NULL);
+
+  if (stats_printed == false) {
+    stats_printed = true;
+    printf("%s", "\n");
+    print_stats();
+    printf("%s", "\n");
+  }
   return 0;
 }
